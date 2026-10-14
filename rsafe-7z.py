@@ -20,6 +20,7 @@ import re
 import selectors
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -80,12 +81,16 @@ Paths and conflicts:
   Extraction skips existing files by default. --auto-rename keeps both;
   --overwrite replaces existing files. Multiple input archives extract into
   DESTINATION/archive-name/ directories, one per archive.
+  --delete-source-files removes archived files only after testing and publishing
+  the new archive. --prune-empty-dirs also removes empty source directories.
   Dry runs display the plan without prompting for passwords or writing files.
 
 Examples:
   rsafe-7z a Documents backup.7z --ask-password --encrypt-headers
   rsafe-7z --archive --pick-types --search-dir ~/Pictures photos.7z
   rsafe-7z a -i -e png -e jpg --search-dir ~/Pictures --dry-run photos.7z
+  rsafe-7z a --pick-types --search-dir ~/Pictures photos.7z \\
+    --delete-source-files --prune-empty-dirs
   rsafe-7z e backup.7z restored --password 'your password'
   rsafe-7z --extract -i --search-dir ~/Downloads -e 7z restored
   rsafe-7z a Documents backup.7z -p'password' -mhe=on
@@ -111,6 +116,12 @@ Examples:
   parser.set_defaults(headers="off")
   parser.add_argument("--dry-run", action="store_true",
                       help="show the plan without creating or extracting files")
+  parser.add_argument("--delete-source-files", action="store_true",
+                      help="delete archived source files after verification "
+                           "and publication (archiving only)")
+  parser.add_argument("--prune-empty-dirs", action="store_true",
+                      help="after --delete-source-files, remove empty source "
+                           "directories (archiving only)")
   conflicts = parser.add_mutually_exclusive_group()
   conflicts.add_argument("--auto-rename", action="store_true",
                          help="give conflicting output files a new name")
@@ -164,6 +175,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.error("header encryption and --base-dir apply only to archiving")
   if args.action == "archive" and args.flatten:
     parser.error("--flatten applies only to extraction")
+  if args.action == "extract" and (args.delete_source_files
+                                   or args.prune_empty_dirs):
+    parser.error("--delete-source-files and --prune-empty-dirs apply only "
+                 "to archiving")
+  if args.prune_empty_dirs and not args.delete_source_files:
+    parser.error("--prune-empty-dirs requires --delete-source-files")
   if args.password is not None and (not args.password or "\0" in args.password):
     parser.error("the password must be nonempty and cannot contain NUL")
   return args
@@ -354,6 +371,12 @@ def print_plan(args: argparse.Namespace, plans: list[tuple[Path, Path]],
   if args.action == "archive":
     display(f"Compression: {args.level} | Header encryption: {args.headers}",
             console)
+    if args.delete_source_files:
+      display("Source files: delete after archive verification and publication",
+              console)
+      if args.prune_empty_dirs:
+        display("Source directories: prune empty directories after deletion",
+                console)
   else:
     display("Layout: " + ("flat" if args.flatten else "preserve directories"),
             console)
@@ -500,6 +523,81 @@ def run_7z(command: list[str], *, description: str, verbose: bool,
 
 # -- Execution ---------------------------------------------------------------
 
+def source_state(path: Path) -> tuple[int, int, int, int, int, Path]:
+  info = path.lstat()
+  # Do not use ctime: unlinking one hard link changes the others' ctime.
+  return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns,
+          path.parent.resolve())
+
+
+def snapshot_source_files(
+  sources: list[Path], target: Path,
+) -> dict[Path, tuple[int, int, int, int, int, Path]]:
+  """Record cleanup candidates before compression; never follow symlinks."""
+  snapshots = {}
+  visited: set[Path] = set()
+  pending = list(reversed(sources))
+  output = target.parent.resolve() / target.name
+  while pending:
+    source = pending.pop()
+    if source in visited:
+      continue
+    visited.add(source)
+    if source.parent.resolve() / source.name == output:
+      continue
+    state = source_state(source)
+    if stat.S_ISDIR(state[2]):
+      pending.extend(sorted(source.iterdir(), reverse=True))
+    elif stat.S_ISREG(state[2]) or stat.S_ISLNK(state[2]):
+      snapshots[source] = state
+    else:
+      fail(f"cannot safely delete an unsupported source type: {str(source)!r}")
+  return snapshots
+
+
+def prune_empty_dirs(sources: list[Path], console=None) -> int:
+  """Prune only within supplied roots, including the roots themselves."""
+  removed = 0
+  for source in dict.fromkeys(sources):
+    if source.is_symlink() or not source.is_dir():
+      continue
+    for root, _, _ in os.walk(source, topdown=False, followlinks=False):
+      try:
+        Path(root).rmdir()
+      except OSError:
+        # Nonempty, inaccessible, or concurrently changed directories stay.
+        continue
+      removed += 1
+  display(f"Pruned {removed} empty source directories.", console)
+  return removed
+
+
+def delete_source_files(
+  snapshots: dict[Path, tuple[int, int, int, int, int, Path]], console=None,
+) -> int:
+  removed = 0
+  kept = 0
+  for source, expected in snapshots.items():
+    try:
+      if source_state(source) != expected:
+        display(f"Kept changed source file: {str(source)!r}", console)
+        kept += 1
+        continue
+      source.unlink()
+    except FileNotFoundError:
+      continue
+    except OSError as error:
+      display(f"Could not delete source file {str(source)!r}: {error}", console)
+      kept += 1
+      continue
+    removed += 1
+  display(f"Deleted {removed} archived source files.", console)
+  if kept:
+    display(f"Kept {kept} source files; the archive was created successfully.",
+            console)
+  return 1 if kept else 0
+
+
 def create_archive(binary: str, args: argparse.Namespace, sources: list[Path],
                    target: Path, base: Path, password: str | None,
                    console=None) -> int:
@@ -515,6 +613,12 @@ def create_archive(binary: str, args: argparse.Namespace, sources: list[Path],
                   password=password, console=console, cwd=base)
     if code:
       return code
+    if args.delete_source_files:
+      command = [binary, "t", *common_switches(password), "--", str(staged)]
+      code = run_7z(command, description="Verifying archive",
+                    verbose=args.verbose, password=password, console=console)
+      if code:
+        return code
     if args.overwrite:
       if target.is_dir() or target.is_symlink():
         fail("archive output became a directory or symlink; refusing replacement")
@@ -566,7 +670,13 @@ def main(argv: list[str] | None = None) -> int:
   password = password_for(args)
   started = time.monotonic()
   if args.action == "archive":
+    snapshots = (snapshot_source_files(sources, target)
+                 if args.delete_source_files else {})
     code = create_archive(binary, args, sources, target, base, password, console)
+    if code == 0 and args.delete_source_files:
+      code = delete_source_files(snapshots, console)
+      if args.prune_empty_dirs:
+        prune_empty_dirs(raw_sources or [search_root], console)
   else:
     code = 0
     for index, (source, output) in enumerate(plans, start=1):

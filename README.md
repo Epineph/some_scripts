@@ -151,6 +151,35 @@ types such as `tar.gz`. Tab marks multiple types; Enter opens the normal file
 picker with only those types. Esc cancels either step without creating output.
 Both pickers isolate global fzf options and preserve encoded file identities.
 
+To archive the selected files and then remove them from their source folders:
+
+```sh
+./rsafe-7z.py a --pick-types --search-dir "$HOME/Pictures" photos.7z \
+  --delete-source-files --prune-empty-dirs --dry-run
+```
+
+Remove `--dry-run` to perform the operation. Both cleanup options apply only to
+archiving. `--delete-source-files` deletes source files only after compression,
+a successful `7z t` integrity check (using the archive password when supplied),
+and publication of the final archive. A warning, error, cancellation, skipped
+archive, or publication failure leaves the source files in place.
+
+Interactive cleanup applies only to the chosen files. For explicit directory
+inputs without a picker, it applies to the files and symlinks within those
+directories; symlink targets are left alone. Files created after the cleanup
+list was captured are kept. Before each deletion, the wrapper checks the file's
+identity, type, size, modification time, and resolved parent directory. Changed
+or replaced files are kept with a message and a nonzero exit status; the created
+archive remains available. These checks do not lock files against concurrent
+writes.
+
+`--prune-empty-dirs` requires `--delete-source-files`. It removes empty
+directories within the supplied source directories, including those roots when
+empty. With no positional sources, it uses `--search-dir` (or the current
+directory). It leaves nonempty directories, directory symlinks, and directories
+outside those roots in place. Supplying individual files does not prune their
+parent directories. Without `--prune-empty-dirs`, source directories are kept.
+
 To specify types directly and go straight to the file picker:
 
 ```sh
@@ -201,7 +230,8 @@ process arguments, including passwords collected by the private prompt.
 Archive creation stages the result beside the output and publishes it only
 after 7z succeeds. A replacement contains only the current inputs; old members
 are not retained. An output inside a source directory, and the staging
-directory, are excluded from compression. Source files are kept.
+directory, are excluded from compression. Source files are kept by default;
+add `--delete-source-files` to request verified cleanup as described above.
 Extraction uses 7z directly; an error or cancellation can leave files already
 extracted. Native nonzero exit codes are returned to the caller.
 
@@ -221,6 +251,8 @@ The tests use temporary files and mock picker interactions; discovery and
 option checks also use the installed `fd`/`fzf` when available. The 7z checks
 exercise real archive/extract round trips, header encryption, literal filenames,
 conflict modes, and failed-compression preservation when `7z`/`7zz` is installed.
+They also cover source cleanup after verified publication, changed/new files,
+symlinks, hard links, and empty-directory pruning with real fzf selections.
 They never write to block devices.
 
 ## Installation

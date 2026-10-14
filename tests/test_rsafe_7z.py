@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Selection boundaries, conflict handling, and real 7z round trips."""
 
 from __future__ import annotations
@@ -67,6 +68,10 @@ class WrapperTests(WrapperFixture):
       ["a", "-i", "input", "output.7z", "--search-dir", "."],
       ["a", "input", "output.7z", "--password", ""],
       ["a", "input", "output.7z", "--overwrite", "--auto-rename"],
+      ["a", "input", "output.7z", "--prune-empty-dirs"],
+      ["e", "input.7z", "output", "--delete-source-files"],
+      ["e", "input.7z", "output", "--delete-source-files",
+       "--prune-empty-dirs"],
     ):
       with (self.subTest(args=args), mock.patch.object(archive, "select_inputs")
             as picker, mock.patch.object(archive, "run_7z") as run,
@@ -81,14 +86,20 @@ class WrapperTests(WrapperFixture):
           mock.patch.object(archive.getpass, "getpass") as prompt,
           mock.patch.object(archive, "run_7z") as run):
       self.assertEqual(self.call("a", self.file, target, "--dry-run",
-                                 "--encrypt-headers"), 0)
+                                 "--encrypt-headers", "--delete-source-files",
+                                 "--prune-empty-dirs"), 0)
     prompt.assert_not_called()
     run.assert_not_called()
     self.assertFalse(target.parent.exists())
+    self.assertTrue(self.file.exists())
+    self.assertIn("delete after archive verification and publication",
+                  self.logs.getvalue())
+    self.assertIn("prune empty directories", self.logs.getvalue())
 
   def test_both_picker_cancellation_steps_leave_output_absent(self):
     for type_picker in (False, True):
       args = ["a", "-i", "--search-dir", str(self.source), str(self.output)]
+      args.extend(["--delete-source-files", "--prune-empty-dirs"])
       if type_picker:
         args.append("--pick-types")
       with (self.subTest(type_picker=type_picker),
@@ -103,6 +114,7 @@ class WrapperTests(WrapperFixture):
       self.assertEqual(error.exception.code, 130)
       run.assert_not_called()
       self.assertFalse(self.output.exists())
+      self.assertTrue(self.file.exists())
       if type_picker:
         types.assert_called_once()
         files.assert_not_called()
@@ -155,22 +167,65 @@ class WrapperTests(WrapperFixture):
 
   def test_failed_compression_preserves_existing_archive_and_cleans_stage(self):
     self.output.write_bytes(b"previous archive")
-    with (mock.patch.object(archive.shutil, "which", return_value="7z"),
-          mock.patch.object(archive, "run_7z", return_value=2)):
-      self.assertEqual(self.call("a", self.file, self.output, "--overwrite"), 2)
+    for exit_code in (1, 2):
+      with (self.subTest(exit_code=exit_code),
+            mock.patch.object(archive.shutil, "which", return_value="7z"),
+            mock.patch.object(archive, "run_7z", return_value=exit_code)):
+        self.assertEqual(self.call("a", self.file, self.output, "--overwrite",
+                                   "--delete-source-files",
+                                   "--prune-empty-dirs"), exit_code)
     self.assertEqual(self.output.read_bytes(), b"previous archive")
+    self.assertTrue(self.file.exists())
     self.assertEqual(list(self.root.glob(".rsafe-7z-*")), [])
+
+  def test_failed_verification_preserves_sources_and_old_archive(self):
+    self.output.write_bytes(b"previous archive")
+    for exit_code in (1, 2):
+      with (self.subTest(exit_code=exit_code),
+            mock.patch.object(archive.shutil, "which", return_value="7z"),
+            mock.patch.object(archive, "run_7z", side_effect=[0, exit_code])
+            as run):
+        self.assertEqual(self.call("a", self.source, self.output, "--overwrite",
+                                   "--delete-source-files",
+                                   "--prune-empty-dirs"), exit_code)
+      self.assertEqual(run.call_args_list[1].args[0][1], "t")
+      self.assertEqual(self.output.read_bytes(), b"previous archive")
+      self.assertTrue(self.file.exists())
+      self.assertEqual(list(self.root.glob(".rsafe-7z-*")), [])
+
+  def test_publication_failure_and_interruption_preserve_sources(self):
+    for interrupted in (False, True):
+      def run(command, *, interrupted=interrupted, **kwargs):
+        if interrupted:
+          raise KeyboardInterrupt
+        if command[1] == "a":
+          Path(command[command.index("--") + 1]).write_bytes(b"staged")
+        return 0
+
+      with (self.subTest(interrupted=interrupted),
+            mock.patch.object(archive.shutil, "which", return_value="7z"),
+            mock.patch.object(archive, "run_7z", side_effect=run),
+            mock.patch.object(archive.os, "link", side_effect=OSError("failed")),
+            self.assertRaises(KeyboardInterrupt if interrupted else OSError)):
+        self.call("a", self.source, self.output, "--delete-source-files",
+                  "--prune-empty-dirs")
+      self.assertTrue(self.file.exists())
+      self.assertFalse(self.output.exists())
+      self.assertEqual(list(self.root.glob(".rsafe-7z-*")), [])
 
   def test_existing_archive_abort_and_skip_do_not_run_compressor(self):
     self.output.write_bytes(b"previous archive")
     with (mock.patch.object(archive.shutil, "which", return_value="7z"),
           mock.patch.object(archive, "run_7z") as run):
       with self.assertRaises(SystemExit):
-        self.call("a", self.file, self.output)
+        self.call("a", self.file, self.output, "--delete-source-files",
+                  "--prune-empty-dirs")
       self.assertEqual(self.call("a", self.file, self.output,
-                                 "--skip-conflicts"), 0)
+                                 "--skip-conflicts", "--delete-source-files",
+                                 "--prune-empty-dirs"), 0)
     run.assert_not_called()
     self.assertEqual(self.output.read_bytes(), b"previous archive")
+    self.assertTrue(self.file.exists())
 
   def test_password_confirmation_failure_does_not_create_archive(self):
     with (mock.patch.object(archive.shutil, "which", return_value="7z"),
@@ -215,6 +270,203 @@ class IntegrationTests(WrapperFixture):
     return subprocess.run([SEVEN_ZIP, "l", "-slt", "-ba", *switches,
                            "--", str(path)], stdin=subprocess.DEVNULL,
                           capture_output=True, timeout=10, check=False)
+
+  def test_delete_after_encrypted_verification_and_publication_then_prune(self):
+    nested = self.source / "nested"
+    nested.mkdir()
+    data = nested / "picture.jpg"
+    data.write_bytes(b"picture")
+    original = archive.run_7z
+    original_delete = archive.delete_source_files
+    actions = []
+
+    def run(command, **kwargs):
+      actions.append(command[1])
+      self.assertTrue(self.file.exists())
+      self.assertTrue(data.exists())
+      self.assertFalse(self.output.exists())
+      return original(command, **kwargs)
+
+    def delete(*args, **kwargs):
+      self.assertTrue(self.output.exists())
+      listing = self.listing(self.output, "-pcleanup-secret")
+      self.assertEqual(listing.returncode, 0)
+      return original_delete(*args, **kwargs)
+
+    with (mock.patch.object(archive, "run_7z", side_effect=run),
+          mock.patch.object(archive, "delete_source_files", side_effect=delete)):
+      self.assertEqual(self.call("a", self.source, self.output,
+                                 "--encrypt-headers", "-pcleanup-secret",
+                                 "--delete-source-files", "--prune-empty-dirs",
+                                 "--verbose"), 0)
+    self.assertEqual(actions, ["a", "t"])
+    self.assertTrue(self.output.exists())
+    self.assertFalse(self.source.exists())
+    self.assertTrue(self.root.is_dir())
+    self.assertNotIn("cleanup-secret", self.logs.getvalue())
+    destination = self.root / "restored"
+    self.assertEqual(self.call("e", self.output, destination,
+                               "-pcleanup-secret"), 0)
+    self.assertEqual((destination / "source" / "chosen.txt").read_text(),
+                     "chosen content")
+    self.assertEqual((destination / "source/nested/picture.jpg").read_bytes(),
+                     b"picture")
+
+  def test_delete_without_prune_keeps_directories_and_literal_filenames(self):
+    names = ["@list.txt", "-switch.txt", "a *?[x].txt", "quote ' $;\n.txt"]
+    for name in names:
+      (self.source / name).write_text(name)
+    self.assertEqual(self.call("a", self.source, self.file, self.output,
+                               "--delete-source-files"), 0)
+    self.assertTrue(self.source.is_dir())
+    self.assertEqual(list(self.source.iterdir()), [])
+    destination = self.root / "restored"
+    self.assertEqual(self.call("e", self.output, destination), 0)
+    for name in names:
+      self.assertEqual((destination / "source" / name).read_text(), name)
+
+  def test_cleanup_keeps_changed_replaced_and_new_files(self):
+    replacement = self.source / "replaced.txt"
+    replacement.write_text("original")
+    added = self.source / "new.txt"
+    original = archive.run_7z
+
+    def run(command, **kwargs):
+      code = original(command, **kwargs)
+      if command[1] == "a":
+        self.file.write_text("new content after compression")
+        new_file = self.root / "replacement"
+        new_file.write_text("replacement")
+        new_file.replace(replacement)
+        added.write_text("new file")
+      return code
+
+    with mock.patch.object(archive, "run_7z", side_effect=run):
+      self.assertEqual(self.call("a", self.source, self.output,
+                                 "--delete-source-files",
+                                 "--prune-empty-dirs"), 1)
+    self.assertEqual(self.file.read_text(), "new content after compression")
+    self.assertEqual(replacement.read_text(), "replacement")
+    self.assertEqual(added.read_text(), "new file")
+    destination = self.root / "restored"
+    self.assertEqual(self.call("e", self.output, destination), 0)
+    self.assertEqual((destination / "source" / "chosen.txt").read_text(),
+                     "chosen content")
+    self.assertEqual((destination / "source" / "replaced.txt").read_text(),
+                     "original")
+
+  def test_cleanup_keeps_file_when_parent_redirects_to_same_inode(self):
+    original = archive.run_7z
+    moved = self.root / "moved"
+
+    def run(command, **kwargs):
+      code = original(command, **kwargs)
+      if command[1] == "a":
+        self.source.rename(moved)
+        self.source.symlink_to(moved, target_is_directory=True)
+      return code
+
+    with mock.patch.object(archive, "run_7z", side_effect=run):
+      self.assertEqual(self.call("a", self.source, self.output,
+                                 "--delete-source-files",
+                                 "--prune-empty-dirs"), 1)
+    self.assertTrue(self.source.is_symlink())
+    self.assertEqual((moved / "chosen.txt").read_text(), "chosen content")
+
+  def test_cleanup_reports_unlink_failure_and_retains_archive(self):
+    unlink = Path.unlink
+
+    def deny_source(path, *args, **kwargs):
+      if path == self.file:
+        raise PermissionError("source deletion denied")
+      return unlink(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "unlink", autospec=True,
+                           side_effect=deny_source):
+      self.assertEqual(self.call("a", self.source, self.output,
+                                 "--delete-source-files",
+                                 "--prune-empty-dirs"), 1)
+    self.assertEqual(self.file.read_text(), "chosen content")
+    self.assertTrue(self.output.exists())
+    self.assertEqual(self.listing(self.output).returncode, 0)
+    self.assertIn("source deletion denied", self.logs.getvalue())
+
+  def test_cleanup_excludes_output_inside_source(self):
+    output = self.source / "backup.7z"
+    output.write_bytes(b"previous archive")
+    self.assertEqual(self.call("a", self.source, output, "--overwrite",
+                               "--delete-source-files",
+                               "--prune-empty-dirs"), 0)
+    self.assertEqual(list(self.source.iterdir()), [output])
+    listing = self.listing(output)
+    self.assertEqual(listing.returncode, 0)
+    self.assertIn(b"source/chosen.txt", listing.stdout)
+    self.assertNotIn(b"backup.7z", listing.stdout)
+
+  def test_cleanup_unlinks_symlinks_and_hard_links_and_keeps_targets(self):
+    outside = self.root / "outside"
+    outside.mkdir()
+    kept = outside / "keep.txt"
+    kept.write_text("outside content")
+    (self.source / "linked-file").symlink_to(kept)
+    (self.source / "linked-dir").symlink_to(outside, target_is_directory=True)
+    (self.source / "dangling-link").symlink_to("missing")
+    (self.source / "hard-link.txt").hardlink_to(self.file)
+    self.assertEqual(self.call("a", self.source, self.output,
+                               "--delete-source-files",
+                               "--prune-empty-dirs"), 0)
+    self.assertFalse(self.source.exists())
+    self.assertEqual(kept.read_text(), "outside content")
+    destination = self.root / "restored"
+    self.assertEqual(self.call("e", self.output, destination), 0)
+    restored = destination / "source"
+    self.assertEqual((restored / "chosen.txt").read_text(), "chosen content")
+    self.assertEqual((restored / "hard-link.txt").read_text(), "chosen content")
+    self.assertTrue((restored / "linked-file").is_symlink())
+    self.assertTrue((restored / "linked-dir").is_symlink())
+    self.assertTrue((restored / "dangling-link").is_symlink())
+
+  def test_cleanup_file_input_does_not_prune_its_parent(self):
+    self.assertEqual(self.call("a", self.file, self.output,
+                               "--delete-source-files",
+                               "--prune-empty-dirs"), 0)
+    self.assertFalse(self.file.exists())
+    self.assertTrue(self.source.is_dir())
+
+  @unittest.skipUnless(FD and FZF, "fd/fzf are not installed")
+  def test_type_picker_cleanup_prunes_empty_directories_inside_source_roots(self):
+    empty_after = self.source / "pictures" / "nested"
+    empty_after.mkdir(parents=True)
+    (empty_after / "photo.JPG").write_bytes(b"image")
+    unrelated = self.root / "unrelated-empty"
+    unrelated.mkdir()
+    run_original = subprocess.run
+
+    def filter_run(command, **kwargs):
+      if command[0] == FZF:
+        term = "jpg" if "--prompt=File types> " in command else ".JPG"
+        command = [*command, f"--filter={term}"]
+      return run_original(command, **kwargs)
+
+    for explicit_source in (False, True):
+      if explicit_source:
+        empty_after.mkdir(parents=True)
+        (empty_after / "photo.JPG").write_bytes(b"image")
+      inputs = ([str(self.source)] if explicit_source
+                else ["--search-dir", str(self.source)])
+      with (self.subTest(explicit_source=explicit_source),
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch.object(archive.subprocess, "run", side_effect=filter_run)):
+        self.assertEqual(self.call("a", "--pick-types", "--no-preview", *inputs,
+                                   self.output, "--overwrite",
+                                   "--delete-source-files",
+                                   "--prune-empty-dirs"), 0)
+      self.assertTrue(self.file.exists())
+      self.assertFalse(empty_after.parent.exists())
+      self.assertTrue(unrelated.is_dir())
+      listing = self.listing(self.output)
+      self.assertIn(b"pictures/nested/photo.JPG", listing.stdout)
+      self.assertNotIn(b"chosen.txt", listing.stdout)
 
   def test_encrypted_headers_and_password_round_trip_with_redacted_logs(self):
     # Exercise literal wildcard/@listfile names and newlines through real 7z.
