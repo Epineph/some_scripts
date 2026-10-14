@@ -115,3 +115,23 @@ python3 -m unittest discover -s tests -v
 The tests use temporary files and mock picker interactions; discovery and
 option checks also use the installed `fd`/`fzf` when available. They never write
 to block devices.
+
+## installation
+
+You can install easily by choosing a path, found on `$PATH`, e.g., `/usr/local/bin` like::
+
+```sh
+sudo install -Dm755 rsafe-rsync.py \
+  /usr/local/bin/rsafe-rsync
+sudo install -Dm755 rdd-ionice.py \
+  /usr/local/bin/rdd-ionice
+sudo install -Dm644 file_picker.py \
+  /usr/local/bin/file_picker.py
+```
+
+The path can be found to `path`, by appending it to the `rc` (e.g., `~/.bashrc`, `~/.zshrc`, etc.) associated with the `$SHELL` you are using - for example:
+
+```sh
+echo 'export PATH="/usr/local/bin:$PATH"' | sudo tee -a ~/.zshrc'
+source ~/.zshrc
+```
